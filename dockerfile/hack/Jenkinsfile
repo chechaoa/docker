@@ -1,0 +1,90 @@
+// params defined in Jenkins pipeline setting
+
+// building jobs params
+def SHA1 = "${params.sha1}"
+def GITLAB_CREDENTIAL_ID = "${params.github_credential_id}"
+def GITHUB_REPOSITORY = "${params.ghprbGhRepository}"
+
+// slack params
+def SLACK_CHANNEL = "${params.slack_channel}"
+def SLACK_TOKEN_CREDENTIAL_ID = "${params.slack_token_credential_id}"
+def COMMENT_BODY = "${params.ghprbCommentBody}"
+def SOURCE_BRANCH = "${params.ghprbSourceBranch}"
+
+// docker registry prefix
+def DOCKER_REGISTRY_PREFIX = "cargo.caicloud.xyz"
+def SOURCE_REGISTRY = "${params.source_registry}"
+def SOURCE_REGISTRY_CREDENTIAL_ID = "${params.source_registry_credential_id}"
+
+// this guarantees the node will use this template
+def POD_NAME = "dockerfile-release-${UUID.randomUUID().toString()}"
+
+// Kubernetes pod template to run.
+podTemplate(
+    cloud: "dev-cluster",
+    namespace: "kube-system",
+    name: POD_NAME,
+    label: POD_NAME,
+    yaml: """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - env:
+    - name: DOCKER_HOST
+      value: unix:///home/jenkins/docker.sock
+    - name: COMMENT_BODY
+      value: "${COMMENT_BODY}"
+    - name: SOURCE_BRANCH
+      value: "${SOURCE_BRANCH}"
+    - name: GITHUB_REPOSITORY
+      value: "${GITHUB_REPOSITORY}"
+    name: golang-docker
+    image: "${DOCKER_REGISTRY_PREFIX}/release/golang-jenkins:v0.0.6"
+    imagePullPolicy: Always
+    tty: true
+  - name: jnlp
+    args: ["\$(JENKINS_SECRET)", "\$(JENKINS_NAME)"]
+    image: "${DOCKER_REGISTRY_PREFIX}/library/jnlp-slave:3.14-1-alpine"
+    imagePullPolicy: IfNotPresent
+  - name: dind
+    args:
+    - --host=unix:///home/jenkins/docker.sock
+    image: "${DOCKER_REGISTRY_PREFIX}/library/docker:17.09-dind"
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      privileged: true
+    tty: true
+""",
+) {
+    node(POD_NAME) {
+        try {
+            container("golang-docker") {
+                docker.withRegistry("https://${SOURCE_REGISTRY}", "${SOURCE_REGISTRY_CREDENTIAL_ID}") {
+                    stage("Checkout") {
+                        retry(10) {
+                            checkout scm
+                        }
+                    }
+                    withCredentials([usernamePassword(credentialsId: "${GITHUB_CREDENTIAL_ID}", passwordVariable: "GITHUB_TOKEN", usernameVariable: "GITHUB_USERNAME")]) {
+                        stage("Building image") {
+                            sh """
+                                bash hack/git-log.sh
+                            """
+                        }
+                    }
+                }
+                    MESSAGE = ":white_check_mark:【Succeed】Building image "
+                    slackAlert("${MESSAGE}", "${SLACK_CHANNEL}")
+            }
+         }catch (Exception e) {
+         MESSAGE = ":x:【Failed】Building image"
+         slackAlert("${MESSAGE}", "${SLACK_CHANNEL}")
+         throw e
+        }
+    }
+}
+
+def slackAlert(MESSAGE, SLACK_CHANNEL) {
+    slackSend baseUrl: "${SLACK_BASE_URL}", channel: "${SLACK_CHANNEL}", failOnError: true, message: "${MESSAGE}", tokenCredentialId: "${SLACK_TOKEN_CREDENTIAL_ID}"
+}
